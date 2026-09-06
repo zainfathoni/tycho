@@ -20,6 +20,7 @@ require_relative "domain/agent_store"
 require_relative "domain/delegation_actor"
 require_relative "domain/agent_archive_store"
 require_relative "domain/usage_metrics"
+require_relative "domain/open_run_feed"
 require_relative "domain/server_identity"
 require_relative "domain/tycho_updater"
 require_relative "domain/schedule_daemon_supervisor"
@@ -615,9 +616,22 @@ module HQ
         end
       end
 
+      class MetricsOpenRuns < Dry::CLI::Command
+        extend CommandMetadata
+
+        desc "List managed runs that have started and are not durably finalized"
+        remote_options
+        usage_template "metrics open-runs [--server SERVER_KEY] [--json]"
+
+        def call(**opts)
+          exit CLICommand.open_runs(opts, out: out, err: err)
+        end
+      end
+
       register "metrics", Metrics do |prefix|
         prefix.register "query", MetricsQuery
         prefix.register "backfill", MetricsBackfill
+        prefix.register "open-runs", MetricsOpenRuns
       end
     end
 
@@ -660,7 +674,8 @@ module HQ
     ].freeze
     METRICS_COMMANDS = [
       Commands::MetricsQuery,
-      Commands::MetricsBackfill
+      Commands::MetricsBackfill,
+      Commands::MetricsOpenRuns
     ].freeze
     COMMAND_NAME = "tycho"
     RUNTIME_COMMANDS = [
@@ -776,6 +791,23 @@ module HQ
       print_metrics(result, json: opts[:json], out:)
       0
     rescue ArgumentError => e
+      failure(e.message, err:)
+    end
+
+    def open_runs(opts = {}, out: $stdout, err: $stderr)
+      return remote_open_runs(opts, out:, err:) if remote_requested?(opts)
+
+      print_open_runs(OpenRunFeed.call(load_all_agents), json: opts[:json], out:)
+      0
+    rescue StandardError => e
+      failure("Failed to list open runs: #{e.message}", err: err)
+    end
+
+    def remote_open_runs(opts, out:, err:)
+      result = remote_client(opts[:server]).request("GET", "/metrics/open-runs")
+      print_open_runs(result, json: opts[:json], out:)
+      0
+    rescue RemoteCLIClient::Error, ArgumentError => e
       failure(e.message, err:)
     end
 
@@ -1707,6 +1739,21 @@ module HQ
         value = opts[key]
         result[key.to_s] = value unless value.to_s.strip.empty?
       end
+    end
+
+    def print_open_runs(result, json:, out:)
+      if json
+        out.puts JSON.pretty_generate(result)
+        return
+      end
+
+      runs = Array(result["runs"])
+      return out.puts("No open runs.") if runs.empty?
+
+      rows = runs.map do |run|
+        [run["run_id"], run["project_key"], run["started_at"], run["status"], run["liveness"]]
+      end
+      out.puts agent_table(%w[Run Project Started Status Liveness], rows)
     end
 
     def print_metrics(result, json:, out:)

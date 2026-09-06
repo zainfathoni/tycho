@@ -410,6 +410,7 @@ Conversation entries are projected from `AgentChatLog#chat_blocks` when availabl
 | `POST` | `/agents/{key}/loop-schedule` | Adopt one idle agent as a temporary recurring schedule and run it immediately. |
 | `GET` | `/metrics` | Query normalized run and native-session metrics with inclusive `from`, exclusive `to`, timezone, and attribution filters. |
 | `POST` | `/metrics/backfill` | Idempotently backfill metrics from durable manifests and optional legacy raw telemetry. |
+| `GET` | `/metrics/open-runs` | List managed runs that have started and are not yet durably finalized. Closed, privacy-clean payload. |
 | `GET` | `/settings/session-loops` | Read Loop session interval, cutoff, and prompt-template defaults. |
 | `PATCH` | `/settings/session-loops` | Save Loop session defaults in `hq.yml`. |
 | `GET` | `/push/config` | Read browser push readiness and VAPID public key. |
@@ -447,6 +448,68 @@ Conversation entries are projected from `AgentChatLog#chat_blocks` when availabl
 | `GET` | `/favicon.svg`, `/favicon.ico` | Serve the Remote UI favicon. |
 
 For peer resource routes, the browser may send `X-Tycho-Remote-Server-Token` when that peer's token lives in browser local storage. The broker converts it to the peer request's `Authorization: Bearer ...` header and does not persist it. The compatibility `/servers/{key}/proxy/{path}` route accepts only the same agent, project, and attachment roots; server-level paths are rejected.
+
+
+## `GET /metrics/open-runs`
+
+The complement of `GET /metrics`. `/metrics` is authoritative for **finalized** runs; this route reports runs that have started and have not yet been durably finalized, so an external reconciler can observe in-flight runtime without reading Tycho's private state files.
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-06T08:00:00.000Z",
+  "runs": [
+    {
+      "run_id": "9f1c2c7e-6b1a-4f0e-9a3d-2b7c5e8d1a44",
+      "project_key": "cukup",
+      "started_at": "2026-09-06T07:12:44.000Z",
+      "status": "running",
+      "liveness": "alive"
+    }
+  ]
+}
+```
+
+The CLI equivalent is `tycho metrics open-runs [--server SERVER_KEY] [--json]`, which emits byte-identical JSON.
+
+### Fields
+
+`run_id` is the run's durable `SecureRandom.uuid`, minted when the run is spawned. It is stable across restarts and reveals nothing about the agent, project, machine, or user.
+
+`project_key` is the configured project key from `hq.yml`.
+
+`started_at` is UTC RFC 3339 with exactly three fractional digits. **Durable precision is one second**, floored: the agent manifest persists `started_at` at one-second precision, so the sub-second digits are always `000`. Flooring (rather than truncating toward zero) guarantees the reported instant is always at or before the one Tycho recorded, for negative epoch values as well as positive. This makes the payload a pure function of durable state — a live run and the same run read back after a Tycho restart serialize identically, which lets a consumer derive a deterministic identity from `run_id` without ever seeing two different instants for one run.
+
+`status` is the run's own status, which is `running` for every entry this route currently returns. It is present so the payload stays explicit rather than implied.
+
+`liveness` is a **best-effort process observation**, never a terminal fact:
+
+| Value | Meaning |
+|---|---|
+| `alive` | A pid is recorded, the process responds to signal 0, and it leads its own process group. |
+| `exited` | A durable run status file exists; the process finished and finalization has not been polled yet. |
+| `dead` | A pid is recorded and the process is gone. |
+| `unknown` | No pid is recorded, or the pid is alive but does not lead its own process group and may have been reused. |
+
+`liveness` is computed at read time from the current process table and is not persisted; two calls a second apart can differ with no change in run state. `alive` is subject to PID reuse and is not evidence that a run is still producing work. **`liveness` must never be treated as a terminal timestamp.** A run that crashed without durable finalization stays in this feed with `liveness: dead` and acquires a terminal fact only when Tycho finalizes it into `/metrics`. Consumers must not synthesize an end from a `dead` observation.
+
+### Exclusions
+
+Every field is built from an explicit literal in `HQ::OpenRunFeed`, not by filtering a wider hash, so a new attribute on `ManagedAgent` or `AgentRun` cannot leak in by default. The route deliberately excludes: workspace and any absolute path, command line, prompt or draft text, run summary, structured result, native harness session ID, model and provider, PID, agent key, schedule key, delegation metadata, and credentials.
+
+This is why `GET /agents` cannot serve this purpose: its payload includes `workspace`, `log_path`, `prompt`, `pid`, and `model`, and it is agent-scoped rather than run-scoped.
+
+### Selection rules
+
+A run appears only if all of the following hold:
+
+- its agent is active — archived agents have no live runs;
+- its status is `running` and it has no `finished_at`;
+- its `run_id` is UUID-shaped. Legacy runs backfilled with a SHA-256 digest are excluded because that identity is stable but not random.
+
+An agent's pid and its run status file both describe its **last** run only. `liveness` is therefore reported for at most one run per agent: the newest open run, and only when that run is also the newest run overall. Every other open run — an earlier run abandoned without finalization, or any open run left behind a newer terminal run — reports `liveness: unknown` rather than inheriting a signal it does not own.
+
+Runs are ordered by `started_at` then `run_id`, independent of agent order. `managed_agents.json` is written through an fsynced atomic rename, so polling this route against a live Tycho cannot observe a partial write.
 
 ## Endpoint Details
 

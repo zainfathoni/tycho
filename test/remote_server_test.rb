@@ -28,6 +28,7 @@ module RemoteServerTest
     assert_remote_agent_payload_has_cost_snapshot
     assert_remote_memory_handoffs
     assert_remote_metrics_query_and_backfill_routes
+    assert_remote_open_runs_route
     assert_remote_inquiry_payload_has_stable_id_and_guarded_answer
     assert_remote_inquiry_dismiss_restore_and_retirement_lifecycle
     assert_remote_agent_payload_includes_attachments
@@ -1812,6 +1813,68 @@ module RemoteServerTest
              "expected Remote UI payload to show a running summary for recorded history")
       assert(service.send(:agent_payload, never_run)[:summary] == "No runs yet",
              "expected Remote UI payload to preserve the never-run empty state")
+    end
+  end
+
+  # The open-run feed is the supported read for runtime that has not reached the
+  # usage-metrics surface. It must expose run identity, project, start, status,
+  # and liveness -- and nothing that carries content.
+  def assert_remote_open_runs_route
+    with_remote_temp_store do |dir|
+      workspace = File.join(dir, "workspace")
+      write_project_workspace(workspace)
+      registry = registry_for_project(dir, workspace)
+      service = HQ::RemoteService.new(registry: registry)
+
+      run_id = "9f1c2c7e-6b1a-4f0e-9a3d-2b7c5e8d1a44"
+      started = Time.utc(2026, 9, 6, 7, 12, 44) + 0.318
+      open_run = HQ::ManagedAgent::AgentRun.new(
+        run_id: run_id, status: "running", started_at: started,
+        session_id: "native-session-should-never-appear",
+        command: "claude --resume secret", model: "claude-opus-5", agent: "claude",
+        log_path: File.join(dir, "agents", "demo.raw.log")
+      )
+      finished = HQ::ManagedAgent::AgentRun.new(
+        run_id: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", status: "success",
+        started_at: started - 600, finished_at: started - 300
+      )
+      agent = HQ::ManagedAgent.new(
+        key: "open-run-agent", name: "Open run agent", project_key: "demo",
+        template_key: "custom", workspace: workspace,
+        prompt: "Do not leak this prompt.", runs: [finished, open_run]
+      )
+      service.define_singleton_method(:load_all_agents) { [agent] }
+
+      server = HQ::RemoteServer.new
+      body = server.send(:route, service, "GET", "/metrics/open-runs", {}, nil).fetch(:body)
+
+      assert(body.fetch("schema_version") == 1, "expected a versioned open-run payload")
+      runs = body.fetch("runs")
+      assert(runs.length == 1, "expected only the open run, got #{runs.length}")
+      entry = runs.fetch(0)
+      assert(entry.keys.sort == %w[liveness project_key run_id started_at status],
+             "expected exactly the contract fields, got #{entry.keys.sort.inspect}")
+      assert(entry.fetch("run_id") == run_id, "expected the durable run id")
+      assert(entry.fetch("project_key") == "demo", "expected the project key")
+      assert(entry.fetch("status") == "running", "expected running status")
+      assert(entry.fetch("started_at") == "2026-09-06T07:12:44.000Z",
+             "expected UTC start truncated to whole seconds, got #{entry.fetch("started_at")}")
+
+      # The same run read back through the manifest must serialize identically.
+      round_tripped = HQ::ManagedAgent::AgentRun.from_hash(open_run.to_hash)
+      replayed = HQ::ManagedAgent.new(
+        key: "open-run-agent", name: "Open run agent", project_key: "demo",
+        template_key: "custom", workspace: workspace, prompt: "Prompt",
+        runs: [round_tripped]
+      )
+      assert(HQ::OpenRunFeed.call([replayed]).fetch("runs") == runs,
+             "expected a manifest round-trip to produce an identical feed entry")
+
+      serialized = JSON.generate(body)
+      ["workspace", dir, "Do not leak", "native-session-should-never-appear", "claude-opus-5",
+       "--resume", ".raw.log", "open-run-agent"].each do |forbidden|
+        assert(!serialized.include?(forbidden), "expected #{forbidden.inspect} to stay out of the open-run feed")
+      end
     end
   end
 

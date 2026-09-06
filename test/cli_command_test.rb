@@ -25,6 +25,7 @@ module CLICommandTest
     assert_remote_client_reports_timeout_and_unsupported_operation
     assert_debug_claude_is_listed_in_usage
     assert_metrics_commands_are_listed_in_usage
+    assert_open_runs_command_emits_the_contract_payload
     assert_debug_claude_run_agent_uses_claude_defaults
     puts "cli_command_test: ok"
   end
@@ -233,6 +234,59 @@ module CLICommandTest
     end
   end
 
+  # The CLI and the Remote API must emit byte-identical JSON so a reconciler can
+  # switch between a local and a --server read without special-casing either.
+  def assert_open_runs_command_emits_the_contract_payload
+    Dir.mktmpdir("hq-open-runs-test") do |dir|
+      workspace = File.join(dir, "workspace")
+      FileUtils.mkdir_p(workspace)
+      run_id = "9f1c2c7e-6b1a-4f0e-9a3d-2b7c5e8d1a44"
+      open_run = HQ::ManagedAgent::AgentRun.new(
+        run_id: run_id, status: "running", started_at: Time.utc(2026, 9, 6, 7, 12, 44),
+        session_id: "native-session-should-never-appear", command: "claude --resume secret",
+        model: "claude-opus-5"
+      )
+      agent = HQ::ManagedAgent.new(
+        key: "open-run-agent", name: "Open run agent", project_key: "demo",
+        template_key: "custom", workspace: workspace,
+        prompt: "Do not leak this prompt.", runs: [open_run]
+      )
+      # CLICommand uses module_function, so the singleton entry must be restored
+      # rather than removed -- removing it would delete the real implementation.
+      original = HQ::CLICommand.method(:load_all_agents)
+      HQ::CLICommand.define_singleton_method(:load_all_agents) { [agent] }
+
+      begin
+        out = StringIO.new
+        err = StringIO.new
+        code = HQ::CLICommand.open_runs({ json: true }, out: out, err: err)
+        assert(code.zero?, "expected metrics open-runs to succeed, stderr=#{err.string}")
+
+        payload = JSON.parse(out.string)
+        assert(payload.fetch("schema_version") == 1, "expected a versioned CLI payload")
+        entry = payload.fetch("runs").fetch(0)
+        assert(entry.keys.sort == %w[liveness project_key run_id started_at status],
+               "expected exactly the contract fields, got #{entry.keys.sort.inspect}")
+        assert(entry.fetch("run_id") == run_id, "expected the durable run id")
+        assert(entry.fetch("started_at") == "2026-09-06T07:12:44.000Z", "expected UTC millisecond start")
+        assert(entry.fetch("liveness") == "unknown", "expected unknown liveness with no recorded pid")
+
+        ["Do not leak", "native-session-should-never-appear", "claude-opus-5", "--resume",
+         "open-run-agent", workspace].each do |forbidden|
+          assert(!out.string.include?(forbidden),
+                 "expected #{forbidden.inspect} to stay out of the CLI open-run payload")
+        end
+
+        table = StringIO.new
+        assert(HQ::CLICommand.open_runs({ json: false }, out: table, err: err).zero?,
+               "expected the table rendering to succeed")
+        assert(table.string.include?(run_id), "expected the table to show the run id")
+      ensure
+        HQ::CLICommand.define_singleton_method(:load_all_agents, original)
+      end
+    end
+  end
+
   def assert_metrics_commands_are_listed_in_usage
     output = StringIO.new
     status = HQ::CLICommand.usage(nil, err: output)
@@ -241,6 +295,7 @@ module CLICommandTest
     assert(status.zero?, "expected metrics help rendering to succeed")
     assert(text.include?("metrics query") && text.include?("metrics backfill"),
            "expected metrics query and backfill in CLI usage")
+    assert(text.include?("metrics open-runs"), "expected metrics open-runs in CLI usage")
   end
 
   def assert_remote_client_reports_timeout_and_unsupported_operation

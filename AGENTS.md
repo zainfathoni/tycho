@@ -18,6 +18,7 @@ Runtime artifacts are written to `~/.tycho/logs/`, including app state files suc
 - `bundle exec bin/tycho project <key> [options]` and `project create|show|update|archive`: manage project configuration from the CLI.
 - `bundle exec bin/tycho schedule [list|daemon --once|daemon --dry-run]`: list schedules, run the scheduled-agent daemon, or run a single scheduler tick.
 - `bundle exec bin/tycho metrics query [filters] [--json]` and `metrics backfill [--timezone ZONE]`: query or idempotently rebuild normalized run/native-session usage metrics.
+- `bundle exec bin/tycho metrics open-runs [--server SERVER_KEY] [--json]`: list managed runs that have started and are not yet durably finalized, as a closed privacy-clean payload for external reconcilers.
 - `bin/test`: run the public CI-equivalent Ruby syntax and regression suite.
 - `bin/remote-ui-smoke`: start a throwaway Remote UI server with temp config/log roots, create a fixture agent, and run a Chrome/Playwright smoke check for composer refresh preservation and mobile dock layout.
 - `bin/remote-ui-phase2-smoke`: run the Phase 2 FRED UI smoke against the current checkout by default with isolated fixture roots; set `TYCHO_PHASE2_BACKEND_ROOT=/path/to/reviewed/archive` for a paired reviewed Beta snapshot, and set `TYCHO_PLAYWRIGHT_PATH` or `TYCHO_CHROME_PATH` when local dependencies are outside the checkout.

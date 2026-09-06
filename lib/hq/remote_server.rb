@@ -50,6 +50,7 @@ require_relative "domain/personal_assistant_action_worker"
 require_relative "domain/visibility"
 require_relative "domain/web_push_notifier"
 require_relative "domain/usage_metrics"
+require_relative "domain/open_run_feed"
 require_relative "domain/remote_server_control"
 
 module HQ
@@ -518,6 +519,7 @@ module HQ
       return ok(service.resource_snapshot) if method == "GET" && parts == ["resources"]
       return ok(service.metrics_query(request&.query_params || {})) if method == "GET" && parts == ["metrics"]
       return ok(service.metrics_backfill(body)) if method == "POST" && parts == ["metrics", "backfill"]
+      return ok(service.open_runs) if method == "GET" && parts == ["metrics", "open-runs"]
       if method == "GET" && parts == ["agents", "archived"]
         return ok(service.archived_agents(request&.query_params || {}))
       end
@@ -3800,6 +3802,13 @@ module HQ
       UsageMetrics.query(filters)
     rescue ArgumentError => e
       raise Error.new(e.message, status: 400)
+    end
+
+    # Managed runs that have started and have not been durably finalized.
+    # Deliberately narrower than #agents: no workspace, command, prompt,
+    # summary, structured result, native session ID, model, pid, or agent key.
+    def open_runs
+      OpenRunFeed.call(load_all_agents)
     end
 
     def metrics_backfill(attrs = {})
