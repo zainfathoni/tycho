@@ -411,6 +411,7 @@ Conversation entries are projected from `AgentChatLog#chat_blocks` when availabl
 | `GET` | `/metrics` | Query normalized run and native-session metrics with inclusive `from`, exclusive `to`, timezone, and attribution filters. |
 | `POST` | `/metrics/backfill` | Idempotently backfill metrics from durable manifests and optional legacy raw telemetry. |
 | `GET` | `/metrics/open-runs` | List managed runs that have started and are not yet durably finalized. Closed, privacy-clean payload. |
+| `GET` | `/metrics/interactions` | List timestamp-only records of explicit human interactions. Same `from`/`to`/`timezone` window as `/metrics`. |
 | `GET` | `/settings/session-loops` | Read Loop session interval, cutoff, and prompt-template defaults. |
 | `PATCH` | `/settings/session-loops` | Save Loop session defaults in `hq.yml`. |
 | `GET` | `/push/config` | Read browser push readiness and VAPID public key. |
@@ -510,6 +511,70 @@ A run appears only if all of the following hold:
 An agent's pid and its run status file both describe its **last** run only. `liveness` is therefore reported for at most one run per agent: the newest open run, and only when that run is also the newest run overall. Every other open run — an earlier run abandoned without finalization, or any open run left behind a newer terminal run — reports `liveness: unknown` rather than inheriting a signal it does not own.
 
 Runs are ordered by `started_at` then `run_id`, independent of agent order. `managed_agents.json` is written through an fsynced atomic rename, so polling this route against a live Tycho cannot observe a partial write.
+
+
+## `GET /metrics/interactions`
+
+A durable, append-only record of **explicit human interactions** with managed agents. It answers "when did a person act?" — a question no other Tycho store can answer for an external reader, because prompt-queue entries are deleted once dispatched, lifecycle hooks are best-effort notifications, and `memory.jsonl` is private and destructively rebuilt by `rebuild_memory_from_raw_log!`.
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-06T08:00:00.000Z",
+  "from": "2026-09-06T00:00:00.000Z",
+  "to": "2026-09-07T00:00:00.000Z",
+  "observations": [
+    {
+      "schema_version": 1,
+      "observation_id": "3f5b9c21-8d44-4e1a-9b02-6c7d8e9f0a1b",
+      "project_key": "cukup",
+      "kind": "prompt_submitted",
+      "observed_at": "2026-09-06T07:12:44.318Z"
+    }
+  ]
+}
+```
+
+The CLI equivalent is `tycho metrics interactions [--from TIME] [--to TIME] [--timezone ZONE] [--server SERVER_KEY] [--json]`.
+
+`from` is inclusive, `to` is exclusive, and an offset-free boundary requires a named IANA timezone — the same contract as `GET /metrics`. An invalid boundary returns `400`.
+
+### Kinds
+
+| Kind | Recorded when |
+|---|---|
+| `prompt_submitted` | A person submits a prompt or follow-up to an ordinary agent, including a prompt queued while the agent is running. |
+| `inquiry_answered` | A person answers a pending inquiry. One answer is one observation, whether or not it carried feedback. |
+| `run_taken_over` | A person prompts an agent that a parent agent owns, taking it over. |
+
+### The write-once invariant
+
+`observation_id` is a random UUID assigned when the record is appended, and it is stable because **the record is never rewritten**. Unlike `usage_metrics.json`, records are never upserted by identity; unlike `memory.jsonl`, they are never regenerated from a raw log. There is no rebuild path. A reader may therefore derive a deterministic identity from `observation_id` and treat repeated reads as idempotent.
+
+Appends take an exclusive file lock, append one JSON object per line, and `fsync`. A partially written trailing line, or any record missing a field or carrying an unknown kind, is skipped on read rather than repaired — a reader is never handed a guessed value.
+
+Retention is 365 days. Pruning runs only when the log exceeds 8 MiB, and it drops whole expired records; it never edits, renumbers, or re-times a surviving one.
+
+### Exclusions
+
+Each record carries exactly `schema_version`, `observation_id`, `project_key`, `kind`, and `observed_at`. There is no message text, draft, or excerpt — and no derived measure of content either, such as message length or attachment count. There is no `agent_key`, no `run_id` (a submission often precedes any run), no author identity, and no native session ID.
+
+### What is deliberately not observed
+
+Working Time built on this feed is a **lower bound**. These are automatic and never recorded:
+
+- scheduled prompts (`add_scheduled_message!`);
+- a parent agent prompting its delegated child;
+- prompt-queue dispatch, which happens after the person acted — the observation is taken at the accepted instant instead;
+- hook auto-answers to inquiries;
+- Personal Assistant internal summary messages;
+- process liveness, generated output, and run finalization.
+
+These are human but **not currently covered**, and each is a known coverage gap rather than a bug:
+
+- **Prompt composition.** Tycho has no supported timestamp-only composition signal, so a session is observed no earlier than submission. A future TUI/Remote UI capability could emit debounced composition timestamps; it must never expose drafts, keys, or content.
+- **Restarting an existing agent** (`tycho agent run`) adds no authored input and is not observed. Creating an agent from an authored prompt is.
+- **Suspending or restoring an inquiry** without answering it.
 
 ## Endpoint Details
 

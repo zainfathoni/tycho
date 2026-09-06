@@ -21,6 +21,7 @@ require_relative "domain/delegation_actor"
 require_relative "domain/agent_archive_store"
 require_relative "domain/usage_metrics"
 require_relative "domain/open_run_feed"
+require_relative "domain/interaction_log"
 require_relative "domain/server_identity"
 require_relative "domain/tycho_updater"
 require_relative "domain/schedule_daemon_supervisor"
@@ -628,10 +629,26 @@ module HQ
         end
       end
 
+      class MetricsInteractions < Dry::CLI::Command
+        extend CommandMetadata
+
+        desc "List timestamp-only records of explicit human interactions"
+        option :from, desc: "Inclusive start boundary"
+        option :to, desc: "Exclusive end boundary"
+        option :timezone, desc: "Named IANA timezone for offset-free boundaries"
+        remote_options
+        usage_template "metrics interactions [--from TIME] [--to TIME] [--timezone ZONE] [--server SERVER_KEY] [--json]"
+
+        def call(**opts)
+          exit CLICommand.interactions(opts, out: out, err: err)
+        end
+      end
+
       register "metrics", Metrics do |prefix|
         prefix.register "query", MetricsQuery
         prefix.register "backfill", MetricsBackfill
         prefix.register "open-runs", MetricsOpenRuns
+        prefix.register "interactions", MetricsInteractions
       end
     end
 
@@ -675,7 +692,8 @@ module HQ
     METRICS_COMMANDS = [
       Commands::MetricsQuery,
       Commands::MetricsBackfill,
-      Commands::MetricsOpenRuns
+      Commands::MetricsOpenRuns,
+      Commands::MetricsInteractions
     ].freeze
     COMMAND_NAME = "tycho"
     RUNTIME_COMMANDS = [
@@ -792,6 +810,35 @@ module HQ
       0
     rescue ArgumentError => e
       failure(e.message, err:)
+    end
+
+    def interactions(opts = {}, out: $stdout, err: $stderr)
+      return remote_interactions(opts, out:, err:) if remote_requested?(opts)
+
+      filters = interaction_filters(opts)
+      print_interactions(InteractionLog.new.feed(filters), json: opts[:json], out:)
+      0
+    rescue ArgumentError => e
+      failure(e.message, err: err)
+    rescue StandardError => e
+      failure("Failed to list interactions: #{e.message}", err: err)
+    end
+
+    def remote_interactions(opts, out:, err:)
+      query = URI.encode_www_form(interaction_filters(opts))
+      path = query.empty? ? "/metrics/interactions" : "/metrics/interactions?#{query}"
+      result = remote_client(opts[:server]).request("GET", path)
+      print_interactions(result, json: opts[:json], out:)
+      0
+    rescue RemoteCLIClient::Error, ArgumentError => e
+      failure(e.message, err:)
+    end
+
+    def interaction_filters(opts)
+      %i[from to timezone].each_with_object({}) do |key, result|
+        value = opts[key]
+        result[key.to_s] = value.to_s unless value.to_s.strip.empty?
+      end
     end
 
     def open_runs(opts = {}, out: $stdout, err: $stderr)
@@ -1443,6 +1490,10 @@ module HQ
       existing.unshift(agent)
       agent = persist_agents_with_parent!(agent_store, existing, agent, opts, creating: true)
       agent_store.accept_prompt_from!(agent, actor: opts.fetch(:actor), agents: existing) if agent.delegation_parent
+      # Creating an agent from an authored prompt is the human composing and
+      # submitting work. Restarting an existing agent adds no authored input and
+      # is deliberately not observed.
+      agent_store.record_prompt_interaction!(agent, opts.fetch(:actor)) unless prompt.strip.empty?
 
       if opts[:run]
         agent = agent_store.start_agent!(agent.key)
@@ -1642,6 +1693,7 @@ module HQ
       agent.add_user_message!(message, metadata: agent.message_author_metadata(opts.fetch(:actor)))
       store.save(agents)
       scheduler.resume_after_user_message(agent.key) if opts.fetch(:actor).user? && agent.scheduled?
+      store.record_prompt_interaction!(agent, opts.fetch(:actor))
       agent = store.start_agent!(agent.key)
       if agent.running?
         print_sent_agent(agent_cli_payload(agent), json: opts[:json], out: out)
@@ -1739,6 +1791,21 @@ module HQ
         value = opts[key]
         result[key.to_s] = value unless value.to_s.strip.empty?
       end
+    end
+
+    def print_interactions(result, json:, out:)
+      if json
+        out.puts JSON.pretty_generate(result)
+        return
+      end
+
+      observations = Array(result["observations"])
+      return out.puts("No interactions.") if observations.empty?
+
+      rows = observations.map do |entry|
+        [entry["observed_at"], entry["project_key"], entry["kind"], entry["observation_id"]]
+      end
+      out.puts agent_table(%w[Observed Project Kind Observation], rows)
     end
 
     def print_open_runs(result, json:, out:)

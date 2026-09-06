@@ -26,6 +26,7 @@ module CLICommandTest
     assert_debug_claude_is_listed_in_usage
     assert_metrics_commands_are_listed_in_usage
     assert_open_runs_command_emits_the_contract_payload
+    assert_interactions_command_emits_the_contract_payload
     assert_debug_claude_run_agent_uses_claude_defaults
     puts "cli_command_test: ok"
   end
@@ -287,6 +288,48 @@ module CLICommandTest
     end
   end
 
+  def assert_interactions_command_emits_the_contract_payload
+    Dir.mktmpdir("hq-interactions-cli-test") do |dir|
+      old_agents_file = HQ.send(:remove_const, :AGENTS_FILE)
+      HQ.const_set(:AGENTS_FILE, File.join(dir, "managed_agents.json"))
+      begin
+        log = HQ::InteractionLog.new
+        log.record!(project_key: "demo", kind: HQ::InteractionLog::PROMPT_SUBMITTED,
+                    observed_at: Time.utc(2026, 9, 6, 7, 0, 0))
+        log.record!(project_key: "demo", kind: HQ::InteractionLog::INQUIRY_ANSWERED,
+                    observed_at: Time.utc(2026, 9, 7, 7, 0, 0))
+
+        out = StringIO.new
+        err = StringIO.new
+        assert(HQ::CLICommand.interactions({ json: true }, out: out, err: err).zero?,
+               "expected metrics interactions to succeed, stderr=#{err.string}")
+        payload = JSON.parse(out.string)
+        assert(payload.fetch("observations").length == 2, "expected both observations")
+        assert(payload.fetch("observations").fetch(0).keys.sort == HQ::InteractionLog::FIELDS.sort,
+               "expected exactly the contract fields")
+
+        # from is inclusive and to is exclusive, matching metrics query.
+        windowed = StringIO.new
+        assert(HQ::CLICommand.interactions(
+          { json: true, from: "2026-09-06", to: "2026-09-07", timezone: "UTC" }, out: windowed, err: err
+        ).zero?, "expected a windowed query to succeed")
+        assert(JSON.parse(windowed.string).fetch("observations").length == 1,
+               "expected the exclusive upper boundary to drop the second observation")
+
+        assert(HQ::CLICommand.interactions({ from: "nonsense", timezone: "UTC" },
+                                           out: StringIO.new, err: StringIO.new) == 1,
+               "expected an invalid boundary to fail cleanly")
+
+        table = StringIO.new
+        assert(HQ::CLICommand.interactions({}, out: table, err: err).zero?, "expected table rendering to succeed")
+        assert(table.string.include?("prompt_submitted"), "expected the table to show the kind")
+      ensure
+        HQ.send(:remove_const, :AGENTS_FILE)
+        HQ.const_set(:AGENTS_FILE, old_agents_file)
+      end
+    end
+  end
+
   def assert_metrics_commands_are_listed_in_usage
     output = StringIO.new
     status = HQ::CLICommand.usage(nil, err: output)
@@ -296,6 +339,7 @@ module CLICommandTest
     assert(text.include?("metrics query") && text.include?("metrics backfill"),
            "expected metrics query and backfill in CLI usage")
     assert(text.include?("metrics open-runs"), "expected metrics open-runs in CLI usage")
+    assert(text.include?("metrics interactions"), "expected metrics interactions in CLI usage")
   end
 
   def assert_remote_client_reports_timeout_and_unsupported_operation

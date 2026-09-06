@@ -51,6 +51,7 @@ require_relative "domain/visibility"
 require_relative "domain/web_push_notifier"
 require_relative "domain/usage_metrics"
 require_relative "domain/open_run_feed"
+require_relative "domain/interaction_log"
 require_relative "domain/remote_server_control"
 
 module HQ
@@ -520,6 +521,7 @@ module HQ
       return ok(service.metrics_query(request&.query_params || {})) if method == "GET" && parts == ["metrics"]
       return ok(service.metrics_backfill(body)) if method == "POST" && parts == ["metrics", "backfill"]
       return ok(service.open_runs) if method == "GET" && parts == ["metrics", "open-runs"]
+      return ok(service.interactions(request&.query_params || {})) if method == "GET" && parts == ["metrics", "interactions"]
       if method == "GET" && parts == ["agents", "archived"]
         return ok(service.archived_agents(request&.query_params || {}))
       end
@@ -3809,6 +3811,14 @@ module HQ
     # summary, structured result, native session ID, model, pid, or agent key.
     def open_runs
       OpenRunFeed.call(load_all_agents)
+    end
+
+    # Timestamp-only records of explicit human interactions. Deliberately carries
+    # no message text, draft, length, attachment detail, agent key, or run id.
+    def interactions(filters = {})
+      InteractionLog.new.feed(filters)
+    rescue ArgumentError => e
+      raise Error.new(e.message, status: 400)
     end
 
     def metrics_backfill(attrs = {})

@@ -7,6 +7,7 @@ require_relative "managed_agent"
 require_relative "delegation_coordinator"
 require_relative "schedule_store"
 require_relative "visibility"
+require_relative "interaction_log"
 require_relative "../ui/rendering/styles"
 require "securerandom"
 
@@ -38,12 +39,38 @@ module HQ
 
     attr_reader :delegation_coordinator
 
-    def initialize(projects, usage_metrics_store: nil, delegation_coordinator: nil)
+    def initialize(projects, usage_metrics_store: nil, delegation_coordinator: nil, interaction_log: nil)
       @projects = projects
       @usage_metrics_store = usage_metrics_store || UsageMetrics.store(
         path: File.join(File.dirname(AGENTS_FILE), "usage_metrics.json")
       )
       @delegation_coordinator = delegation_coordinator || DelegationCoordinator.new
+      @interaction_log = interaction_log || InteractionLog.new
+    end
+
+    # Record one explicit human interaction. Observation is telemetry: a failure
+    # here must never discard the action the person actually took, so every error
+    # is logged and swallowed. Automatic paths -- scheduled prompts, delegated
+    # parent prompts, prompt-queue dispatch, hook auto-answers, and Personal
+    # Assistant internal messages -- never call this.
+    def record_interaction!(agent, kind:, observed_at: nil)
+      return nil unless agent
+
+      @interaction_log.record!(project_key: agent.project_key, kind:, observed_at:)
+    rescue StandardError => e
+      HQ.logger.warn("Agent") { "Failed to record #{kind} interaction: #{e.message}" }
+      nil
+    end
+
+    # One human prompt is one observation. Prompting an agent a parent agent owns
+    # is a takeover; prompting an ordinary agent is a submission. A parent actor
+    # is automatic orchestration and is never observed.
+    def record_prompt_interaction!(agent, actor, observed_at: nil)
+      return nil unless agent
+      return nil unless actor.nil? || actor.user?
+
+      kind = agent.delegation_parent ? InteractionLog::RUN_TAKEN_OVER : InteractionLog::PROMPT_SUBMITTED
+      record_interaction!(agent, kind:, observed_at:)
     end
 
     def load
@@ -394,7 +421,7 @@ module HQ
 
     def enqueue_prompt_from!(key, prompt:, attachments: nil, actor:, accepted_at: nil, id: nil,
                              client_request_id: nil, message_metadata: nil, source: nil)
-      with_exclusive_lock do
+      target, entry = with_exclusive_lock do
         agents, = load_with_poll_events_unlocked(process_delegations: false, dispatch_prompt_queues: false)
         target = find_agent_in!(agents, key)
         raise ArgumentError, "Agent is no longer running" unless target.running?
@@ -418,6 +445,11 @@ module HQ
           [target, entry]
         end
       end
+      # The queue entry dispatches later; the human acted when it was accepted.
+      # Observed after the lock releases so a telemetry failure cannot roll the
+      # prompt back.
+      record_prompt_interaction!(target, actor, observed_at: accepted_at)
+      [target, entry]
     end
 
     def edit_queued_prompt!(key, entry_id, prompt:)
@@ -493,7 +525,7 @@ module HQ
         message_metadata = [author_metadata, metadata].select { |value| value.is_a?(Hash) }.reduce({}) { |result, value| result.merge(value) }
         target.add_user_message!(text, attachments:, metadata: message_metadata, event_id:)
         target
-      end
+      end.tap { |target| record_prompt_interaction!(target, actor) }
     end
 
     def answer_inquiry!(key, inquiry_id:, answer:, attachments:, feedback: nil, feedback_embedded: false, metadata: nil, event_id_prefix: nil)
@@ -513,6 +545,9 @@ module HQ
           target.add_user_message!(feedback, metadata: feedback_metadata, event_id: feedback_event_id)
         end
         target
+      end.tap do |target|
+        # One answer is one interaction, whether or not it carried feedback.
+        record_interaction!(target, kind: InteractionLog::INQUIRY_ANSWERED)
       end
     end
 

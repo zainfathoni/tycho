@@ -29,6 +29,7 @@ module RemoteServerTest
     assert_remote_memory_handoffs
     assert_remote_metrics_query_and_backfill_routes
     assert_remote_open_runs_route
+    assert_human_interactions_are_observed_and_automation_is_not
     assert_remote_inquiry_payload_has_stable_id_and_guarded_answer
     assert_remote_inquiry_dismiss_restore_and_retirement_lifecycle
     assert_remote_agent_payload_includes_attachments
@@ -1875,6 +1876,72 @@ module RemoteServerTest
        "--resume", ".raw.log", "open-run-agent"].each do |forbidden|
         assert(!serialized.include?(forbidden), "expected #{forbidden.inspect} to stay out of the open-run feed")
       end
+    end
+  end
+
+  # Working Time depends on observing only explicit human action. A scheduled
+  # prompt, a delegated parent prompt, or prompt-queue dispatch must produce
+  # nothing, and a telemetry failure must never discard the person's prompt.
+  def assert_human_interactions_are_observed_and_automation_is_not
+    with_remote_temp_store do |dir|
+      workspace = File.join(dir, "workspace")
+      write_project_workspace(workspace)
+      registry = registry_for_project(dir, workspace)
+      service = HQ::RemoteService.new(registry: registry)
+      created = service.create_agent(
+        "project_key" => "web", "name" => "Interaction agent", "prompt" => "Observe", "agent" => "codex"
+      )
+      projects = registry.projects.map { |config| HQ::Project.new(config) }
+      store = HQ::AgentStore.new(projects)
+      log = HQ::InteractionLog.new
+      kinds = -> { log.entries.map { |entry| entry.fetch("kind") } }
+
+      assert(kinds.call.empty?, "expected agent creation through the Remote API to record nothing yet")
+
+      service.submit_prompt(created[:key], "prompt" => "Please start the review.")
+      assert(kinds.call == %w[prompt_submitted], "expected one submission, got #{kinds.call.inspect}")
+      assert(log.entries.fetch(0).fetch("project_key") == "web", "expected the project key on the observation")
+
+      # Automation: a scheduled prompt and a prompt-queue dispatch are not human.
+      agent = store.load.find { |item| item.key == created[:key] }
+      store.add_scheduled_message!(agent, schedule_key: "nightly", message: "Scheduled work")
+      store.save([agent])
+      assert(kinds.call == %w[prompt_submitted], "expected a scheduled prompt to record nothing")
+
+      # A parent agent prompting its delegated child is orchestration, not a person.
+      child = service.create_agent(
+        "project_key" => "web", "name" => "Delegated child", "prompt" => "Child", "agent" => "codex",
+        "parent_agent_key" => created[:key]
+      )
+      before = kinds.call.length
+      service.submit_prompt(child[:key], "prompt" => "Continue.", "parent_agent_key" => created[:key])
+      assert(kinds.call.length == before, "expected a delegated parent prompt to record nothing")
+
+      # A person prompting that same delegated child is an explicit takeover.
+      service.submit_prompt(child[:key], "prompt" => "I am taking this over.")
+      assert(kinds.call.last == "run_taken_over", "expected a human prompt to a delegated child to be a takeover")
+
+      response = HQ::RemoteServer.new.send(:route, service, "GET", "/metrics/interactions", {}, nil)
+      body = response.fetch(:body)
+      assert(body.fetch("schema_version") == 1, "expected a versioned interactions payload")
+      entry = body.fetch("observations").fetch(0)
+      assert(entry.keys.sort == HQ::InteractionLog::FIELDS.sort,
+             "expected exactly the contract fields, got #{entry.keys.sort.inspect}")
+      assert(!JSON.generate(body).include?("Please start the review"), "expected no prompt text in the feed")
+
+      # A telemetry failure must not cost the human their prompt.
+      failing = Object.new
+      def failing.record!(**) = raise("interaction log unavailable")
+      broken = HQ::AgentStore.new(projects, interaction_log: failing)
+      target = broken.accept_ordinary_prompt!(
+        created[:key], text: "Survives telemetry failure.", attachments: [],
+        actor: HQ::DelegationActor.user_actor
+      )
+      assert(target.messages.last.content == "Survives telemetry failure.",
+             "expected the prompt to be accepted even when the interaction log raises")
+      journaled = HQ::AgentMemory.new(broken.load.find { |item| item.key == created[:key] }).events
+      assert(journaled.any? { |event| event["content"] == "Survives telemetry failure." },
+             "expected the accepted prompt to reach the durable transcript")
     end
   end
 
