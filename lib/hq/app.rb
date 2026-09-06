@@ -2240,6 +2240,7 @@ def selected_screen_items
       if @agent_chat_form.inquiry_active?
         @agent_store.accept_delegation_prompt!(agent, owner: "user")
         agent.add_user_message!(content)
+        # The TUI composer has no non-human caller, so no actor gate is needed here.
         @agent_store.record_interaction!(agent, kind: HQ::InteractionLog::INQUIRY_ANSWERED)
       else
         begin

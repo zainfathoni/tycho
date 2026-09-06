@@ -48,11 +48,14 @@ module HQ
       @interaction_log = interaction_log || InteractionLog.new
     end
 
-    # Record one explicit human interaction. Observation is telemetry: a failure
-    # here must never discard the action the person actually took, so every error
-    # is logged and swallowed. Automatic paths -- scheduled prompts, delegated
-    # parent prompts, prompt-queue dispatch, hook auto-answers, and Personal
-    # Assistant internal messages -- never call this.
+    # Record one explicit human interaction. Observation is telemetry and must
+    # never discard the action the person actually took, which holds for two
+    # reasons: every error is logged and swallowed, and callers observe *after*
+    # mutate has released its lock and persisted the agent. Do not move a call
+    # inside a mutate block -- an exception there would skip save_unlocked and
+    # drop the prompt. Automatic paths -- scheduled prompts, delegated parent
+    # prompts, prompt-queue dispatch, hook auto-answers, and Personal Assistant
+    # internal messages -- never call this.
     def record_interaction!(agent, kind:, observed_at: nil)
       return nil unless agent
 
@@ -67,7 +70,7 @@ module HQ
     # is automatic orchestration and is never observed.
     def record_prompt_interaction!(agent, actor, observed_at: nil)
       return nil unless agent
-      return nil unless actor.nil? || actor.user?
+      return nil unless actor&.user?
 
       kind = agent.delegation_parent ? InteractionLog::RUN_TAKEN_OVER : InteractionLog::PROMPT_SUBMITTED
       record_interaction!(agent, kind:, observed_at:)

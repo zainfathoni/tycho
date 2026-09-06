@@ -553,7 +553,9 @@ The CLI equivalent is `tycho metrics interactions [--from TIME] [--to TIME] [--t
 
 Appends take an exclusive file lock, append one JSON object per line, and `fsync`. A partially written trailing line, or any record missing a field or carrying an unknown kind, is skipped on read rather than repaired — a reader is never handed a guessed value.
 
-Retention is 365 days. Pruning runs only when the log exceeds 8 MiB, and it drops whole expired records; it never edits, renumbers, or re-times a surviving one.
+Records older than 365 days are dropped the next time the log exceeds 8 MiB; a smaller log is never pruned, so retention is a size-triggered bound rather than a time guarantee. Pruning drops whole expired records and never edits, renumbers, or re-times a surviving one.
+
+There is no index: a query parses the whole log and filters in memory. The 8 MiB cap bounds that cost, which is why a caller polling on a short interval is fine.
 
 ### Exclusions
 

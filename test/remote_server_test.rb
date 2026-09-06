@@ -1921,6 +1921,20 @@ module RemoteServerTest
       service.submit_prompt(child[:key], "prompt" => "I am taking this over.")
       assert(kinds.call.last == "run_taken_over", "expected a human prompt to a delegated child to be a takeover")
 
+      # Observation fails closed. A prompt queued for a running agent reaches the
+      # store through enqueue_prompt_from!, which requires an actor, so no caller
+      # can queue work without declaring who acted. A parent or absent actor then
+      # records nothing even though the call itself succeeds.
+      before_guard = kinds.call.length
+      parent_actor = HQ::DelegationActor.parent_actor(created[:key])
+      assert(store.record_prompt_interaction!(agent, parent_actor).nil?,
+             "expected a parent actor to record nothing")
+      assert(store.record_prompt_interaction!(agent, nil).nil?,
+             "expected a missing actor to record nothing")
+      assert(kinds.call.length == before_guard, "expected the guarded calls to append nothing")
+      assert(store.method(:enqueue_prompt_from!).parameters.include?(%i[keyreq actor]),
+             "expected the queued-prompt entry point to require an actor")
+
       response = HQ::RemoteServer.new.send(:route, service, "GET", "/metrics/interactions", {}, nil)
       body = response.fetch(:body)
       assert(body.fetch("schema_version") == 1, "expected a versioned interactions payload")
